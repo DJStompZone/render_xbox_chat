@@ -1,0 +1,18 @@
+[project]
+name = "renderxboxchat"
+version = "0.1.1"
+description = "Render a saved xbox live conversation as an HTML webpage"
+authors = [
+    {name = "DJ Stomp",email = "85457381+DJStompZone@users.noreply.github.com"}
+]
+license = {text = "MIT"}
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "xbl3auth (>=0.1.0,<0.2.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
