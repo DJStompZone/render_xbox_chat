@@ -63,6 +63,42 @@ def _log(level: str, msg: str) -> None:
     print(f"[{level}] {msg}")
 
 
+def _raise_for_status(resp: Any) -> None:
+    """Call resp.raise_for_status() if available, else emulate it.
+
+    Some tests patch in lightweight response doubles that do not implement
+    ``raise_for_status``. This helper keeps behavior consistent with
+    ``requests.Response`` by raising ``requests.HTTPError`` for HTTP error
+    status codes when the method is missing.
+    """
+
+    raise_func = getattr(resp, "raise_for_status", None)
+    if callable(raise_func):
+        raise_func()
+        return
+
+    status_code = getattr(resp, "status_code", None)
+    if status_code is not None and status_code >= 400:
+        raise requests.HTTPError(response=resp)
+
+
+def _response_text(resp: Any) -> str:
+    """Best-effort conversion of a response body to text for logging."""
+
+    text = getattr(resp, "text", None)
+    if text is not None:
+        return str(text)
+
+    content = getattr(resp, "_content", b"")
+    if isinstance(content, bytes):
+        try:
+            return content.decode()
+        except Exception:
+            return str(content)
+
+    return str(content)
+
+
 def _ensure_dir(path: Path) -> None:
     """Create a directory (and parents) if it does not exist."""
     path.mkdir(parents=True, exist_ok=True)
@@ -134,7 +170,7 @@ def _request_with_backoff(
         # Transient 5xx: exponential backoff.
         if 500 <= resp.status_code < 600:
             if attempt > max_retries:
-                resp.raise_for_status()
+                _raise_for_status(resp)
             _log(
                 str(resp.status_code),
                 f"Transient error on {url}, retrying "
@@ -176,7 +212,7 @@ def fetch_own_xuid(auth_header: str) -> str:
 
     _log("META", f"GET {PROFILE_URL} to fetch own XUID")
     resp = requests.get(PROFILE_URL, headers=headers, timeout=60)
-    resp.raise_for_status()
+    _raise_for_status(resp)
     data = resp.json()
 
     _log("DEBUG", f"Profile settings response: {data}")
@@ -211,14 +247,14 @@ def _fetch_inbox(
     resp = _request_with_backoff(session, "GET", url, headers=headers, params=params)
 
     try:
-        resp.raise_for_status()
+        _raise_for_status(resp)
         # if hasattr(resp, "json") and callable(resp.json):
         #     _log("DEBUG", f"Inbox response: {resp.json()}")
     except requests.HTTPError as exc:
         _log("ERROR", "Error calling inbox endpoint:")
         _log("ERROR", f"  URL:    {resp.url}")
         _log("ERROR", f"  Status: {resp.status_code}")
-        _log("ERROR", f"  Body:   {resp.text[:500]}")
+        _log("ERROR", f"  Body:   {_response_text(resp)[:500]}")
         raise exc
 
     return resp.json()
@@ -313,19 +349,19 @@ def fetch_conversation_pages_for_xuid(
         _log("META", f"[{resp.status_code}] {url} (page {page_index})")
 
         try:
-            resp.raise_for_status()
+            _raise_for_status(resp)
             # if hasattr(resp, "json") and callable(resp.json):
             #     _log("DEBUG", f"History response page {page_index}: {resp.json()}")
             # else:
             #     _log("DEBUG", f"History response page {page_index}: <non-JSON body> {resp.text}")
         except requests.HTTPError as exc:
-            _log("ERROR", f"  Error body: {resp.text[:500]}")
+            _log("ERROR", f"  Error body: {_response_text(resp)[:500]}")
             raise exc
 
         try:
             data = resp.json()
         except ValueError:
-            data = {"_non_json_body": resp.text}
+            data = {"_non_json_body": _response_text(resp)}
 
         pages.append(data)
 

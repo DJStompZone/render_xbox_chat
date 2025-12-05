@@ -52,6 +52,19 @@ def _log(level: str, msg: str) -> None:
     print(f"[{level}] {msg}")
 
 
+def _raise_for_status(resp: Any) -> None:
+    """Call resp.raise_for_status() if available, else emulate it."""
+
+    raise_func = getattr(resp, "raise_for_status", None)
+    if callable(raise_func):
+        raise_func()
+        return
+
+    status_code = getattr(resp, "status_code", None)
+    if status_code is not None and status_code >= 400:
+        raise requests.HTTPError(response=resp)
+
+
 def _parse_locator(locator: str) -> Optional[LocatorInfo]:
     """
     Parse a feedItem locator string into structured components.
@@ -218,7 +231,7 @@ def _download_file(
 ) -> None:
     _log("DL", f"GET {url}")
     resp = session.get(url, headers=headers, stream=True, timeout=60)
-    resp.raise_for_status()
+    _raise_for_status(resp)
     with dest.open("wb") as fp:
         for chunk in resp.iter_content(chunk_size=65536):
             if not chunk:
@@ -246,7 +259,7 @@ def _build_screenshot_index_for_xuid(
     }
     _log("META", f"GET {url}")
     resp = session.get(url, params=params, headers=headers, timeout=60)
-    resp.raise_for_status()
+    _raise_for_status(resp)
     data = resp.json()
     screenshots = data.get("screenshots") or []
     idx: Dict[str, Mapping[str, Any]] = {}
@@ -278,7 +291,7 @@ def _build_gameclip_index_for_xuid(
     }
     _log("META", f"GET {url}")
     resp = session.get(url, params=params, headers=headers, timeout=60)
-    resp.raise_for_status()
+    _raise_for_status(resp)
     data = resp.json()
     clips = data.get("gameClips") or data.get("game_clips") or []
     idx: Dict[str, Mapping[str, Any]] = {}
