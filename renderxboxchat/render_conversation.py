@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 import html
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
@@ -63,7 +63,7 @@ def load_all_messages(input_dir: Path) -> List[Dict[str, Any]]:
             try:
                 dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
             except Exception:  # noqa: BLE001
-                dt = datetime.max
+                dt = datetime.max.replace(tzinfo=timezone.utc)
 
             m["_parsed_ts"] = dt
             m["_raw_ts"] = ts
