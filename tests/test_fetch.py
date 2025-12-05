@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -20,7 +20,7 @@ def test_request_with_backoff_handles_429_then_success():
         FakeResponse(status_code=200),
     ]
     session = SequenceSession(responses)
-    resp = fetch._request_with_backoff(session, "GET", "https://example.test")
+    resp = fetch._request_with_backoff(cast(fetch.requests.Session, session), "GET", "https://example.test")
     assert resp.status_code == 200
     assert len(session.calls) == 2
 
@@ -29,14 +29,14 @@ def test_request_with_backoff_raises_after_exhausting_retries():
     responses = [FakeResponse(status_code=503) for _ in range(fetch.MAX_RETRIES + 1)]
     session = SequenceSession(responses)
     with pytest.raises(Exception):
-        fetch._request_with_backoff(session, "GET", "https://example.test")
+        fetch._request_with_backoff(cast(fetch.requests.Session, session), "GET", "https://example.test")
 
 
 def test_request_with_backoff_raises_runtime_after_429s():
     responses = [FakeResponse(status_code=429, headers={"Retry-After": "not-a-number"}) for _ in range(4)]
     session = SequenceSession(responses)
     with pytest.raises(RuntimeError):
-        fetch._request_with_backoff(session, "GET", "https://example.test", max_retries=3)
+        fetch._request_with_backoff(cast(fetch.requests.Session, session), "GET", "https://example.test", max_retries=3)
 
 
 def test_get_auth_header_returns_explicit_value():
@@ -46,7 +46,7 @@ def test_get_auth_header_returns_explicit_value():
 def test_get_auth_header_uses_xbl3auth(monkeypatch: pytest.MonkeyPatch):
     class DummyService:
         def __init__(self, *_, **__):
-            pass
+            super().__init__()
 
         def get_xbl3_token(self) -> str:
             return "auto-token"
@@ -91,7 +91,7 @@ def test_fetch_conversation_pages_for_xuid_handles_continuation(monkeypatch: pyt
     session = SequenceSession(pages)
     monkeypatch.setattr(fetch, "_request_with_backoff", lambda *args, **kwargs: session.request(*args[1:], **kwargs))
     result = fetch.fetch_conversation_pages_for_xuid(
-        session=session,
+        session=cast(fetch.requests.Session, session),
         token="token",
         xuid="42",
         max_items=10,
@@ -108,7 +108,7 @@ def test_fetch_conversation_pages_handles_non_json(monkeypatch: pytest.MonkeyPat
     ])
     monkeypatch.setattr(fetch, "_request_with_backoff", lambda *args, **kwargs: session.request(*args[1:], **kwargs))
     result = fetch.fetch_conversation_pages_for_xuid(
-        session=session,
+        session=cast(fetch.requests.Session, session),
         token="token",
         xuid="42",
         max_items=10,
@@ -122,7 +122,7 @@ def test_fetch_conversation_pages_raises_for_http_error(monkeypatch: pytest.Monk
     monkeypatch.setattr(fetch, "_request_with_backoff", lambda *args, **kwargs: resp)
     session = SequenceSession([])
     with pytest.raises(fetch.requests.HTTPError):
-        fetch.fetch_conversation_pages_for_xuid(session, token="t", xuid="x", max_items=1, max_pages=1)
+        fetch.fetch_conversation_pages_for_xuid(cast(fetch.requests.Session, session), token="t", xuid="x", max_items=1, max_pages=1)
 
 
 def test_load_conversations_from_inbox_parses_entries(monkeypatch: pytest.MonkeyPatch):
@@ -135,7 +135,7 @@ def test_load_conversations_from_inbox_parses_entries(monkeypatch: pytest.Monkey
         }
     }
     monkeypatch.setattr(fetch, "_fetch_inbox", lambda *_, **__: inbox_response)
-    metas = fetch._load_conversations_from_inbox(session=None, token="token", max_items=10)
+    metas = fetch._load_conversations_from_inbox(session=cast(fetch.requests.Session, SequenceSession([])), token="token", max_items=10)
     assert len(metas) == 1
     assert metas[0].conversation_id == "abc"
     assert metas[0].participants == ["1", "2"]
@@ -166,7 +166,7 @@ def test_fetch_inbox_error_logging(monkeypatch: pytest.MonkeyPatch, capsys: pyte
 
     monkeypatch.setattr(fetch, "_request_with_backoff", lambda *args, **kwargs: resp)
     with pytest.raises(fetch.requests.HTTPError):
-        fetch._fetch_inbox(FailingSession([]), token="tok", max_items=1)
+        fetch._fetch_inbox(cast(fetch.requests.Session, FailingSession([])), token="tok", max_items=1)
     out = capsys.readouterr().out
     assert "Error calling inbox endpoint" in out
 
@@ -207,7 +207,7 @@ def test_fetch_all_conversations_handles_404_then_success(tmp_path: Path, monkey
 
     class HTTP404(fetch.requests.HTTPError):
         def __init__(self):
-            super().__init__(response=FakeResponse(status_code=404))
+            super().__init__(response=cast(fetch.requests.Response, FakeResponse(status_code=404)))
 
     def fake_fetch_pages(**kwargs: Any):
         xuid = kwargs.get("xuid")

@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Mapping, Optional
 
 from renderxboxchat.template import IMAGE_TEMPLATE, VIDEO_EXTS, VIDEO_TEMPLATE, HTML_TEMPLATE
 
-def escape_html(text: str) -> str:
+def escape_html(text: str | None) -> str:
     """
     Safely escape a value for inclusion in HTML.
 

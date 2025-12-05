@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
-import requests
+from requests.structures import CaseInsensitiveDict
 
 # Ensure the project root is importable when tests run without installation.
 ROOT = Path(__file__).resolve().parent.parent
@@ -12,7 +12,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-class FakeResponse(requests.Response):
+class FakeResponse:
+    """A minimal fake response compatible with tests.
+
+    Attributes:
+        status_code: HTTP status code to expose.
+        _json_data: If set, returned from json(); otherwise json() raises ValueError.
+        _content: Raw bytes for iter_content.
+        headers: CaseInsensitiveDict of headers.
+        url: The URL associated with the response.
+    """
+
     def __init__(
         self,
         *,
@@ -26,7 +36,7 @@ class FakeResponse(requests.Response):
         self.status_code = status_code
         self._json_data = json_data
         self._content = text.encode()
-        self.headers = headers or {}
+        self.headers = CaseInsensitiveDict(headers or {})
         self.url = url
 
     def json(self, **_: Any) -> Any:  # type: ignore[override]

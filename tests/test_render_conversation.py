@@ -40,7 +40,7 @@ def test_load_all_messages_sorts_and_handles_bad_files(tmp_path: Path, capsys: p
 def test_render_ctype_image_respects_media_map():
     part = {"downloadUri": "https://example/image.png"}
     html = rc.render_ctype_image(part, media_map={"image:https://example/image.png": "local.png"})
-    assert "local.png" in html
+    assert html and "local.png" in html
 
 
 def test_render_ctype_image_returns_none_when_missing_uri():
@@ -57,13 +57,13 @@ def test_render_ctype_image_returns_none_when_missing_uri():
 def test_render_ctype_feeditem_fallback(locator: str, expected: str):
     part = {"locator": locator}
     html = rc.render_ctype_feeditem(part)
-    assert expected in html
+    assert expected and html and expected in html
 
 
 def test_render_ctype_feeditem_prefers_video_template():
     part = {"locator": "clip", "contentType": "feedItem"}
     html = rc.render_ctype_feeditem(part, media_map={"feedItem:clip": "movie.MP4"})
-    assert "video" in html
+    assert html and "video" in html
     assert "movie.MP4" in html
 
 
