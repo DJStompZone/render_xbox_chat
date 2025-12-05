@@ -1,7 +1,7 @@
 [project]
 name = "renderxboxchat"
-version = "0.1.7"
-description = "Render a saved xbox live conversation as an HTML webpage"
+version = "0.2.0"
+description = "Fetch one or more Xbox Live chat conversations and render them to static HTML."
 authors = [
     {name = "DJ Stomp",email = "85457381+DJStompZone@users.noreply.github.com"}
 ]
