@@ -14,4 +14,20 @@ def replace_template_parts(template: str, translations: dict[str, str]) -> str:
         template = template.replace(key, value)
     return template
 
-html_template = replace_template_parts(__template, template_translations)
+HTML_TEMPLATE = replace_template_parts(__template, template_translations)
+VIDEO_TEMPLATE = """
+<div class="my-2">
+    <video controls class="rounded-lg border max-w-full h-auto shadow">
+        <source src="{src}" />
+        Your browser does not support the video tag.
+    </video>
+</div>
+"""
+IMAGE_TEMPLATE = """
+<div class="my-2">
+    <img src="{src}"
+        alt="feed item"
+        class="rounded-lg border max-w-full h-auto shadow" />
+</div>
+"""
+VIDEO_EXTS = ["mp4", "webm", "mov", "mkv"]

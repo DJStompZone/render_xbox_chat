@@ -1,375 +1,449 @@
 #!/usr/bin/env python3
 """
-Fetch media for Xbox Live conversation feed items.
+Media prefetcher for renderxboxchat.
 
-- Scans conversation_*.json pages for parts with contentType == "feedItem"
-- Locators look like:
-    screenshotsmetadata.xboxlive.com/users/xuid(253...)/scids/.../screenshots/<GUID>
-    gameclipsmetadata.xboxlive.com/users/xuid(253...)/scids/.../clips/<GUID>
-- For each unique locator:
-    * Calls the corresponding metadata endpoint with XBL3 auth from xbl3auth
-    * Picks a suitable download URI
-    * Downloads the image/clip to disk
-- Writes feed_media_index.json mapping:
-    {
-        "<locator>": "screenshots/<id>.jpg",
-        ...
-    }
+Walks conversation messages, discovers:
+  - direct image attachments (contentType == "image")
+  - feed items referencing screenshots or game clips (contentType == "feedItem")
 
-Auth sources (in order of precedence):
-    1. --auth-header CLI flag
-    2. XBL3_AUTH_HEADER environment variable
-    3. xbl3auth library (device code flow + keyring)
+Then:
+  - Resolves metadata via the official Xbox metadata endpoints, using an XBL3.0
+    auth header obtained via the xbl3auth library if the caller does not supply one.
+  - Downloads media to a local directory.
+  - Returns a mapping from logical keys to local file paths for use by the renderer.
 
-Usage:
-    python fetch_feed_media.py \
-        --input-dir raw_conversations/full_conv_... \
-        --out-dir attachments
-
-Optional:
-    python fetch_feed_media.py \
-        --input-dir raw_conversations/full_conv_... \
-        --out-dir attachments \
-        --account-id default \
-        --client-id "your-azure-client-id"
+Logical key schema:
+  - Direct images: f"image:{download_uri}"
+  - Feed items:    f"feedItem:{locator}"
 """
 
 from __future__ import annotations
 
-import argparse
 import json
-import os
-import re
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
-from urllib.parse import urlparse
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
+from urllib.parse import parse_qs, urlparse
 
 import requests
 
 try:
     from xbl3auth import Xbl3AuthService, XblAuthConfig
-except ImportError as exc:  # noqa: BLE001
-    raise SystemExit("xbl3auth is required for this script.\nInstall with: pip install xbl3auth") from exc
+except Exception:  # pragma: no cover - optional import, validated at runtime
+    Xbl3AuthService = None  # type: ignore[assignment]
+    XblAuthConfig = None  # type: ignore[assignment]
 
 
-LOCATOR_RE = re.compile(
-    r"^(?P<host>screenshotsmetadata|gameclipsmetadata)\.xboxlive\.com/(?P<path>.+)$"
-)
+GAMECLIPS_BASE = "https://gameclipsmetadata.xboxlive.com"
+SCREENSHOTS_BASE = "https://screenshotsmetadata.xboxlive.com"
 
 
-def _read_json(path: Path) -> Dict[str, Any]:
-    with path.open("r", encoding="utf-8") as fp:
-        return json.load(fp)
+@dataclass
+class LocatorInfo:
+    kind: str  # "gameclip" or "screenshot"
+    raw: str
+    xuid: str
+    scid: str
+    item_id: str
 
 
-def _iter_message_parts(json_obj: Dict[str, Any]) -> Iterable[Dict[str, Any]]:
-    for msg in json_obj.get("messages") or []:
-        parts = (
-            msg.get("contentPayload", {})
-            .get("content", {})
-            .get("parts", [])
-        )
-        for part in parts:
-            yield part
+def _log(level: str, msg: str) -> None:
+    print(f"[{level}] {msg}")
 
 
-def _collect_locators(input_dir: Path) -> List[str]:
-    locators: set[str] = set()
-    for path in sorted(input_dir.glob("*.json")):
-        try:
-            data = _read_json(path)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[WARN] Failed to parse {path}: {exc}")
-            continue
-
-        for part in _iter_message_parts(data):
-            if part.get("contentType") != "feedItem":
-                continue
-            locator = part.get("locator")
-            if not locator or not isinstance(locator, str):
-                continue
-            if not LOCATOR_RE.match(locator):
-                print(f"[WARN] Skipping unrecognized locator: {locator}")
-                continue
-            locators.add(locator)
-
-    return sorted(locators)
-
-
-def _pick_best_uri(candidates: List[Dict[str, Any]], uri_key: str = "uri") -> str:
+def _parse_locator(locator: str) -> Optional[LocatorInfo]:
     """
-    Choose a "best" URI from the metadata list.
+    Parse a feedItem locator string into structured components.
 
-    Preference:
-    - uriType/uri_type == 'Download' (case-insensitive) if present
-    - otherwise the largest file_size
+    Expected patterns (no scheme, just host + path):
+
+      screenshotsmetadata.xboxlive.com/users/xuid(253...)/scids/{scid}/screenshots/{id}
+      gameclipsmetadata.xboxlive.com/users/xuid(253...)/scids/{scid}/clips/{id}
+
+    Returns None if the shape does not match.
     """
-    if not candidates:
-        raise ValueError("No URIs available in metadata")
+    if not locator:
+        return None
 
-    best_download = None
-    for item in candidates:
-        uri_type = str(item.get("uriType") or item.get("uri_type") or "").lower()
-        if uri_type == "download":
-            best_download = item
-            break
+    parts = locator.split("/")
+    if len(parts) < 7:
+        return None
 
-    if best_download:
-        return str(best_download.get(uri_key))
+    host = parts[0]
+    if not host.endswith("xboxlive.com"):
+        return None
 
-    def size_of(it: Dict[str, Any]) -> int:
-        try:
-            return int(it.get("fileSize") or it.get("file_size") or 0)
-        except Exception:  # noqa: BLE001
-            return 0
+    # host, "users", "xuid(123)", "scids", "{scid}", "screenshots|clips", "{guid}"
+    try:
+        users_token = parts[1]
+        xuid_token = parts[2]
+        scids_token = parts[3]
+        scid = parts[4]
+        kind_segment = parts[5]
+        item_id = parts[6]
+    except IndexError:
+        return None
 
-    best = max(candidates, key=size_of)
-    return str(best.get(uri_key))
+    if users_token != "users" or not xuid_token.startswith("xuid(") or scids_token != "scids":
+        return None
 
+    xuid = xuid_token[len("xuid(") : -1]
 
-def _guess_extension_from_url(url: str) -> str:
-    path = urlparse(url).path
-    if "." in path:
-        ext = path.rsplit(".", 1)[-1].lower()
-        ext = ext.split("?")[0]
-        if ext:
-            return f".{ext}"
-    return ""
+    if "screenshot" in kind_segment:
+        kind = "screenshot"
+    elif "clip" in kind_segment:
+        kind = "gameclip"
+    else:
+        return None
+
+    return LocatorInfo(kind=kind, raw=locator, xuid=xuid, scid=scid, item_id=item_id)
 
 
 def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def _get_auth_header_from_xbl3auth(
-    client_id: str | None,
-    account_id: str,
-) -> str:
+def _infer_extension_from_url(url: str, default: str) -> str:
+    path = url.split("?", 1)[0]
+    _, _, tail = path.rpartition("/")
+    if "." in tail:
+        return tail.split(".")[-1].lower()
+    return default
+
+
+def _sas_is_expired(url: str) -> bool:
     """
-    Use xbl3auth to obtain an XBL3.0 header.
+    Best-effort check for expired Azure Blob SAS URLs by inspecting the `se` query param.
 
-    Respects client_id override; otherwise uses remote/built-in config.
+    Returns True if:
+      - There is an `se` param we can parse, and
+      - It is strictly earlier than "now" in UTC.
+
+    Otherwise returns False.
     """
-    if client_id:
-        cfg = XblAuthConfig(client_id=client_id)
-    else:
-        cfg = XblAuthConfig()
+    try:
+        parsed = urlparse(url)
+        qs = parse_qs(parsed.query)
+        se_vals = qs.get("se") or qs.get("se[]")
+        if not se_vals:
+            return False
+        se_str = se_vals[0]
+        # Typical format: 2023-11-09T05:58:00Z
+        if se_str.endswith("Z"):
+            se_str = se_str.replace("Z", "+00:00")
+        expiry = datetime.fromisoformat(se_str)
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        return expiry < now
+    except Exception:
+        return False
 
-    service = Xbl3AuthService(cfg, account_id=account_id)
-    header = service.get_xbl3_token()
-    if not isinstance(header, str) or not header.startswith("XBL3.0 "):
-        raise RuntimeError("xbl3auth returned an unexpected token format")
-    # Do NOT print the token; just acknowledge we got one.
-    print("[AUTH] Obtained XBL3.0 header via xbl3auth.")
-    return header
 
-
-def _resolve_auth_header(
-    explicit_header: str | None,
-    client_id: str | None,
-    account_id: str,
-) -> str:
+def _get_auth_header(explicit_header: Optional[str]) -> str:
     """
-    Resolve the Authorization header we'll use for Xbox Live calls.
-    Precedence:
-        1. explicit_header (CLI)
-        2. XBL3_AUTH_HEADER env var
-        3. xbl3auth device flow/keyring
+    Return an XBL3.0 Authorization header value.
+
+    If explicit_header is not None, it is returned as-is.
+    Otherwise, xbl3auth is used to obtain a fresh token.
     """
     if explicit_header:
-        print("[AUTH] Using explicit --auth-header value.")
         return explicit_header
 
-    env_header = os.getenv("XBL3_AUTH_HEADER")
-    if env_header:
-        print("[AUTH] Using XBL3_AUTH_HEADER from environment.")
-        return env_header
+    if Xbl3AuthService is None or XblAuthConfig is None:
+        raise RuntimeError("xbl3auth is not installed; cannot auto-obtain XBL3.0 token")
 
-    print("[AUTH] No header supplied; using xbl3auth to obtain XBL3.0 token.")
-    return _get_auth_header_from_xbl3auth(client_id, account_id)
+    _log("AUTH", "No header supplied; using xbl3auth to obtain XBL3.0 token.")
+    config = XblAuthConfig()
+    service = Xbl3AuthService(config, account_id="default")
+    xbl3_token = service.get_xbl3_token()
+    _log("AUTH", "Obtained XBL3.0 header via xbl3auth.")
+    return xbl3_token
 
 
-def _fetch_metadata(
+def _collect_locators(messages: Iterable[Mapping[str, Any]]) -> List[LocatorInfo]:
+    locators: List[LocatorInfo] = []
+
+    for msg in messages:
+        content = msg.get("contentPayload", {}).get("content", {})
+        parts = content.get("parts", []) or []
+        for part in parts:
+            if part.get("contentType") != "feedItem":
+                continue
+            locator_str = part.get("locator") or ""
+            info = _parse_locator(locator_str)
+            if info is not None:
+                locators.append(info)
+
+    return locators
+
+
+def _collect_direct_images(messages: Iterable[Mapping[str, Any]]) -> List[str]:
+    uris: List[str] = []
+    seen: set[str] = set()
+    for msg in messages:
+        content = msg.get("contentPayload", {}).get("content", {})
+        parts = content.get("parts", []) or []
+        for part in parts:
+            if part.get("contentType") != "image":
+                continue
+            uri = part.get("downloadUri") or ""
+            if uri and uri not in seen:
+                seen.add(uri)
+                uris.append(uri)
+    return uris
+
+
+def _group_locators_by_xuid(
+    locators: Iterable[LocatorInfo],
+) -> Tuple[Dict[str, List[LocatorInfo]], Dict[str, List[LocatorInfo]]]:
+    screenshots_by_xuid: Dict[str, List[LocatorInfo]] = {}
+    clips_by_xuid: Dict[str, List[LocatorInfo]] = {}
+
+    for info in locators:
+        if info.kind == "screenshot":
+            screenshots_by_xuid.setdefault(info.xuid, []).append(info)
+        elif info.kind == "gameclip":
+            clips_by_xuid.setdefault(info.xuid, []).append(info)
+
+    return screenshots_by_xuid, clips_by_xuid
+
+
+def _download_file(
     session: requests.Session,
-    locator: str,
+    url: str,
+    dest: Path,
+    headers: Optional[Dict[str, str]] = None,
+) -> None:
+    _log("DL", f"GET {url}")
+    resp = session.get(url, headers=headers, stream=True, timeout=60)
+    resp.raise_for_status()
+    with dest.open("wb") as fp:
+        for chunk in resp.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            fp.write(chunk)
+
+
+def _build_screenshot_index_for_xuid(
+    session: requests.Session,
+    xuid: str,
     auth_header: str,
-) -> Tuple[str, Dict[str, Any]]:
+) -> Dict[str, Mapping[str, Any]]:
     """
-    Fetch metadata for a single locator.
+    Fetch recent screenshots for a given XUID and build a map:
 
-    Returns (kind, metadata_dict) where kind in {"screenshot", "gameclip"}.
+        screenshot_id -> screenshot_json
+
+    Note: This currently only fetches a single page (maxItems=1000).
     """
-    m = LOCATOR_RE.match(locator)
-    if not m:
-        raise ValueError(f"Unsupported locator: {locator}")
-
-    host = m.group("host")
-    path = m.group("path")
-    url = f"https://{host}.xboxlive.com/{path}"
-
-    if host == "screenshotsmetadata":
-        headers = {
-            "Authorization": auth_header,
-            "x-xbl-contract-version": "5",
-        }
-        kind = "screenshot"
-    elif host == "gameclipsmetadata":
-        headers = {
-            "Authorization": auth_header,
-            "x-xbl-contract-version": "1",
-        }
-        kind = "gameclip"
-    else:
-        raise ValueError(f"Unknown locator host: {host}")
-
-    print(f"[META] GET {url}")
-    resp = session.get(url, headers=headers)
+    url = f"{SCREENSHOTS_BASE}/users/xuid({xuid})/screenshots"
+    params = {"skipItems": 0, "maxItems": 1000}
+    headers = {
+        "Authorization": auth_header,
+        "x-xbl-contract-version": "5",
+    }
+    _log("META", f"GET {url}")
+    resp = session.get(url, params=params, headers=headers, timeout=60)
     resp.raise_for_status()
     data = resp.json()
-
-    if kind == "screenshot":
-        container_keys = ["screenshots", "Screenshots"]
-    else:
-        container_keys = ["gameClips", "GameClips", "game_clips"]
-
-    for key in container_keys:
-        if key in data and isinstance(data[key], list) and data[key]:
-            return kind, data[key][0]
-
-    # Fallback: treat the whole response as the item
-    return kind, data
+    screenshots = data.get("screenshots") or []
+    idx: Dict[str, Mapping[str, Any]] = {}
+    for shot in screenshots:
+        sid = shot.get("screenshotId") or shot.get("screenshot_id") or shot.get("screenshotid")
+        if sid:
+            idx[str(sid)] = shot
+    _log("INFO", f"Indexed {len(idx)} screenshots for XUID {xuid}")
+    return idx
 
 
-def _download_file(session: requests.Session, url: str, dest: Path) -> None:
-    print(f"[DL] {url} -> {dest}")
-    with session.get(url, stream=True) as resp:
-        resp.raise_for_status()
-        with dest.open("wb") as fp:
-            for chunk in resp.iter_content(chunk_size=65536):
-                if not chunk:
-                    continue
-                fp.write(chunk)
-
-
-def fetch_all_media(
-    input_dir: Path,
-    out_dir: Path,
+def _build_gameclip_index_for_xuid(
+    session: requests.Session,
+    xuid: str,
     auth_header: str,
-) -> None:
-    locators = _collect_locators(input_dir)
-    print(f"[INFO] Found {len(locators)} unique feedItem locators")
+) -> Dict[str, Mapping[str, Any]]:
+    """
+    Fetch recent clips for a given XUID and build a map:
 
-    if not locators:
-        print("[INFO] Nothing to do.")
-        return
+        game_clip_id -> clip_json
 
+    Note: This currently only fetches a single page (maxItems=1000).
+    """
+    url = f"{GAMECLIPS_BASE}/users/xuid({xuid})/clips"
+    params = {"skipItems": 0, "maxItems": 1000}
+    headers = {
+        "Authorization": auth_header,
+        "x-xbl-contract-version": "1",
+    }
+    _log("META", f"GET {url}")
+    resp = session.get(url, params=params, headers=headers, timeout=60)
+    resp.raise_for_status()
+    data = resp.json()
+    clips = data.get("gameClips") or data.get("game_clips") or []
+    idx: Dict[str, Mapping[str, Any]] = {}
+    for clip in clips:
+        cid = clip.get("gameClipId") or clip.get("game_clip_id") or clip.get("id")
+        if cid:
+            idx[str(cid)] = clip
+    _log("INFO", f"Indexed {len(idx)} clips for XUID {xuid}")
+    return idx
+
+
+def prefetch_media_for_messages(
+    messages: Iterable[Mapping[str, Any]],
+    out_dir: Path,
+    xbl3_header: Optional[str] = None,
+) -> Dict[str, str]:
+    """
+    Prefetch media referenced in a batch of messages.
+
+    Args:
+        messages: Iterable of message dicts from the conversation JSON.
+        out_dir: Directory where media files will be saved. It is created if missing.
+        xbl3_header: Optional Authorization header value
+                    (e.g., "XBL3.0 x=<uhs>;<token>").
+                    If omitted, xbl3auth is used to obtain one.
+
+    Returns:
+        Dict mapping logical keys to relative file paths, e.g.:
+
+            {
+                "image:https://...": "static/img_0001.jpg",
+                "feedItem:screenshotsmetadata.xboxlive.com/...": "static/shot_0001.jpg",
+                "feedItem:gameclipsmetadata.xboxlive.com/...": "static/clip_0001.mp4",
+            }
+    """
+    out_dir = Path(out_dir)
     _ensure_dir(out_dir)
-    screenshots_dir = out_dir / "screenshots"
-    clips_dir = out_dir / "gameclips"
-    _ensure_dir(screenshots_dir)
-    _ensure_dir(clips_dir)
+    base = out_dir.name
 
-    mapping: Dict[str, str] = {}
+    auth_header = _get_auth_header(xbl3_header)
+    headers_auth = {"Authorization": auth_header}
 
-    with requests.Session() as session:
-        for locator in locators:
-            try:
-                kind, meta = _fetch_metadata(session, locator, auth_header)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[ERROR] Metadata fetch failed for {locator}: {exc}")
+    session = requests.Session()
+
+    # Collect feedItem locators and group by type/xuid
+    locators = _collect_locators(messages)
+    unique_locators = {loc.raw: loc for loc in locators}
+    _log("INFO", f"Found {len(unique_locators)} unique feedItem locators")
+
+    screenshots_by_xuid, clips_by_xuid = _group_locators_by_xuid(unique_locators.values())
+
+    # Mapping from logical key -> relative path (relative to HTML file)
+    media_map: Dict[str, str] = {}
+
+    # First, handle direct image parts (no need for metadata)
+    direct_images = _collect_direct_images(messages)
+    for idx, uri in enumerate(direct_images, start=1):
+        ext = _infer_extension_from_url(uri, default="jpg")
+        filename = f"image_{idx:04d}.{ext}"
+        dest = out_dir / filename
+        key = f"image:{uri}"
+
+        # If SAS is obviously expired, don't even bother.
+        if _sas_is_expired(uri):
+            _log("INFO", f"Skipping expired direct image SAS URL: {uri}")
+            continue
+
+        if dest.exists():
+            media_map[key] = f"{base}/{dest.name}"
+            continue
+        try:
+            _download_file(session, uri, dest, headers=None)
+            media_map[key] = f"{base}/{dest.name}"
+        except Exception as exc:
+            _log("WARN", f"Failed to download direct image {uri}: {exc}")
+
+    # Screenshots
+    for xuid, infos in screenshots_by_xuid.items():
+        index = _build_screenshot_index_for_xuid(session, xuid, auth_header)
+        for info in infos:
+            key = f"feedItem:{info.raw}"
+            shot = index.get(info.item_id)
+            if not shot:
+                _log("WARN", f"No screenshot metadata found for locator: {info.raw}")
                 continue
 
-            if kind == "screenshot":
-                uris = meta.get("screenshotUris") or meta.get("screenshot_uris") or []
-                id_key = "screenshotId"
-            else:
-                uris = meta.get("gameClipUris") or meta.get("game_clip_uris") or []
-                id_key = "gameClipId"
-
-            try:
-                download_url = _pick_best_uri(uris)
-            except Exception as exc:  # noqa: BLE001
-                print(f"[ERROR] No usable URIs for {locator}: {exc}")
+            uris = shot.get("screenshotUris") or shot.get("screenshot_uris") or []
+            if not uris:
+                _log("WARN", f"Screenshot has no URIs: locator={info.raw}")
                 continue
 
-            item_id = str(meta.get(id_key) or meta.get(id_key.lower()) or "unknown")
-            ext = _guess_extension_from_url(download_url)
-            if not ext:
-                ext = ".mp4" if kind == "gameclip" else ".jpg"
+            # Prefer a full-resolution download URI if possible
+            chosen = None
+            for entry in uris:
+                uri_type = entry.get("uriType") or entry.get("uri_type") or ""
+                if "download" in uri_type.lower():
+                    chosen = entry
+                    break
+            if chosen is None:
+                chosen = uris[0]
 
-            if kind == "screenshot":
-                dest = screenshots_dir / f"{item_id}{ext}"
-                rel = Path("screenshots") / f"{item_id}{ext}"
-            else:
-                dest = clips_dir / f"{item_id}{ext}"
-                rel = Path("gameclips") / f"{item_id}{ext}"
+            url = chosen.get("uri")
+            if not url:
+                _log("WARN", f"Screenshot URI entry missing 'uri' for locator: {info.raw}")
+                continue
 
+            ext = _infer_extension_from_url(url, default="jpg")
+            filename = f"screenshot_{info.item_id}.{ext}"
+            dest = out_dir / filename
             if dest.exists():
-                print(f"[SKIP] Already exists: {dest}")
-            else:
-                try:
-                    _download_file(session, download_url, dest)
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[ERROR] Download failed for {locator}: {exc}")
-                    continue
+                media_map[key] = f"{base}/{dest.name}"
+                continue
+            try:
+                _download_file(session, url, dest, headers=headers_auth)
+                media_map[key] = f"{base}/{dest.name}"
+            except Exception as exc:
+                _log("WARN", f"Failed to download screenshot for locator {info.raw}: {exc}")
 
-            mapping[locator] = str(rel.as_posix())
+    # Game clips
+    for xuid, infos in clips_by_xuid.items():
+        index = _build_gameclip_index_for_xuid(session, xuid, auth_header)
+        for info in infos:
+            key = f"feedItem:{info.raw}"
+            clip = index.get(info.item_id)
+            if not clip:
+                _log("WARN", f"No clip metadata found for locator: {info.raw}")
+                continue
 
-    index_path = out_dir / "feed_media_index.json"
-    with index_path.open("w", encoding="utf-8") as fp:
-        json.dump(mapping, fp, indent=2, sort_keys=True)
-    print(f"[INFO] Wrote mapping for {len(mapping)} locators -> {index_path}")
+            uris = clip.get("gameClipUris") or clip.get("game_clip_uris") or []
+            if not uris:
+                _log("WARN", f"Clip has no URIs: locator={info.raw}")
+                continue
 
+            chosen = None
+            for entry in uris:
+                uri_type = entry.get("uriType") or entry.get("uri_type") or ""
+                if "download" in uri_type.lower():
+                    chosen = entry
+                    break
+            if chosen is None:
+                chosen = uris[0]
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Prefetch media for Xbox conversation feedItems."
-    )
-    parser.add_argument(
-        "--input-dir",
-        type=Path,
-        required=True,
-        help="Directory containing conversation_..._page_XXX.json files.",
-    )
-    parser.add_argument(
-        "--out-dir",
-        type=Path,
-        default=Path("attachments"),
-        help="Directory where media files and index JSON will be stored.",
-    )
-    parser.add_argument(
-        "--auth-header",
-        type=str,
-        default=None,
-        help=(
-            "Full Authorization header value, e.g. "
-            "'XBL3.0 x=USERHASH;TOKEN'. "
-            "If omitted, XBL3_AUTH_HEADER env var or xbl3auth will be used."
-        ),
-    )
-    parser.add_argument(
-        "--account-id",
-        type=str,
-        default="default",
-        help="xbl3auth account_id label to use when pulling from keyring.",
-    )
-    parser.add_argument(
-        "--client-id",
-        type=str,
-        default=None,
-        help="Optional Azure client ID override for xbl3auth.",
-    )
+            url = chosen.get("uri")
+            if not url:
+                _log("WARN", f"Clip URI entry missing 'uri' for locator: {info.raw}")
+                continue
 
-    args = parser.parse_args()
+            ext = _infer_extension_from_url(url, default="mp4")
+            filename = f"clip_{info.item_id}.{ext}"
+            dest = out_dir / filename
+            if dest.exists():
+                media_map[key] = f"{base}/{dest.name}"
+                continue
+            try:
+                _download_file(session, url, dest, headers=headers_auth)
+                media_map[key] = f"{base}/{dest.name}"
+            except Exception as exc:
+                _log("WARN", f"Failed to download clip for locator {info.raw}: {exc}")
 
-    auth_header = _resolve_auth_header(
-        explicit_header=args.auth_header,
-        client_id=args.client_id,
-        account_id=args.account_id,
-    )
+    # Optionally write an index file for debugging
+    try:
+        index_path = out_dir / "media_index.json"
+        with index_path.open("w", encoding="utf-8") as fp:
+            json.dump(media_map, fp, indent=2, sort_keys=True)
+    except Exception as exc:
+        _log("WARN", f"Failed to write media_index.json: {exc}")
 
-    fetch_all_media(args.input_dir, args.out_dir, auth_header)
-
-
-if __name__ == "__main__":
-    main()
+    return media_map

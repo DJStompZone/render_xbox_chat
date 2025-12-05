@@ -17,11 +17,13 @@ filenames = {
     "search_component": "search.partial.html",
     "nav_component": "nav.partial.html",
     "sort_component": "sort.partial.html",
-    "javascript_main": "script.js",
-    "__template": "template.partial.html",
+    "javascript_main": "script.js"
 }
 
-__template, document_head, search_component, nav_component, sort_component, javascript_main = (
+with open(Path(__file__).parent.parent / "static" / "template.partial.html", encoding="utf-8") as f:
+    __template = f.read()
+
+document_head, search_component, nav_component, sort_component, javascript_main = (
     StaticFiles(name, filename).load()
     for name, filename in filenames.items()
 )

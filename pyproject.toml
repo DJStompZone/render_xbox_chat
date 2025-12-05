@@ -1,6 +1,6 @@
 [project]
 name = "renderxboxchat"
-version = "0.1.1"
+version = "0.1.7"
 description = "Render a saved xbox live conversation as an HTML webpage"
 authors = [
     {name = "DJ Stomp",email = "85457381+DJStompZone@users.noreply.github.com"}
