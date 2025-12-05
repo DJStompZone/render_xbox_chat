@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+from requests import Session as RequestSession
 from tqdm import tqdm
 
 try:
@@ -75,7 +76,7 @@ def _sleep_with_jitter(base_delay: float) -> None:
 
 
 def _request_with_backoff(
-    session: requests.Session,
+    session: RequestSession,
     method: str,
     url: str,
     *,
@@ -193,7 +194,7 @@ def fetch_own_xuid(auth_header: str) -> str:
 
 
 def _fetch_inbox(
-    session: requests.Session,
+    session: RequestSession,
     token: str,
     max_items: int,
 ) -> Dict[str, Any]:
@@ -224,7 +225,7 @@ def _fetch_inbox(
 
 
 def _load_conversations_from_inbox(
-    session: requests.Session,
+    session: RequestSession,
     token: str,
     max_items: int,
 ) -> List[ConversationMeta]:
@@ -273,7 +274,7 @@ def _pages_have_messages(pages: List[Dict[str, Any]]) -> bool:
 
 
 def fetch_conversation_pages_for_xuid(
-    session: requests.Session,
+    session: RequestSession,
     token: str,
     xuid: str,
     max_items: int,
